@@ -1,24 +1,30 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useRef } from 'react';
 import {
-  NavPage,
   SourceVideo,
   VariantConfig,
   GeneratedVariant,
   GenerationJob,
-  Project,
-  AppSettings,
   ToastMessage,
 } from './types';
-import { SAMPLE_VIDEOS } from './data/sampleVideos';
-import { DEFAULT_ADJUSTMENTS, DEFAULT_OPTIONAL_ELEMENTS } from './data/presets';
-import { INITIAL_PROJECTS, INITIAL_HISTORY } from './data/mockProjects';
+import { DEFAULT_ADJUSTMENTS, DEFAULT_METADATA_TEMPLATE, DEFAULT_OPTIONAL_ELEMENTS } from './data/presets';
+import { buildInitialVariants } from './utils/buildVariants';
+import { applyMetadataSpoof, buildVariantMetadata } from './utils/metadataSpoof';
 import {
+  generateFFmpegArgs,
+  generateFFmpegArgsWithoutAudio,
   generateFFmpegCommand,
-  generateRandomizedAdjustments,
-  getResolutionForFormat,
+  generateMinimalWasmArgs,
 } from './utils/ffmpegGenerator';
+import {
+  deleteInputFile,
+  encodeToBlob,
+  getFFmpeg,
+  recoverEncoder,
+  terminateFFmpeg,
+  writeInputFile,
+} from './utils/ffmpegClient';
+import { formatBytes } from './utils/format';
 
-import { Sidebar } from './components/Sidebar';
 import { Header } from './components/Header';
 import { ToastContainer } from './components/ToastContainer';
 import { UploadSection } from './components/generator/UploadSection';
@@ -26,99 +32,46 @@ import { VariantConfigPanel } from './components/generator/VariantConfigPanel';
 import { GenerationProgress } from './components/generator/GenerationProgress';
 import { ResultsGrid } from './components/generator/ResultsGrid';
 import { VariantPreviewModal } from './components/generator/VariantPreviewModal';
-import { DashboardView } from './components/dashboard/DashboardView';
-import { ProjectsView } from './components/projects/ProjectsView';
-import { HistoryView } from './components/history/HistoryView';
-import { SettingsView } from './components/settings/SettingsView';
 
 import JSZip from 'jszip';
 import confetti from 'canvas-confetti';
 
-const STORAGE_KEYS = {
-  PROJECTS: 'vvg_projects_data',
-  HISTORY: 'vvg_history_data',
-  SETTINGS: 'vvg_settings_data',
-};
+function revokeIfBlob(url?: string) {
+  if (url?.startsWith('blob:')) {
+    URL.revokeObjectURL(url);
+  }
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function inputFilenameFor(source: SourceVideo) {
+  const ext = source.name.match(/\.(mp4|webm|mov|mkv|m4v)$/i)?.[0].toLowerCase() || '.mp4';
+  return `input${ext}`;
+}
 
 export default function App() {
-  // Navigation & Page State
-  const [activePage, setActivePage] = useState<NavPage>('generator');
-
-  // Generator Workflow State
   const [generatorStep, setGeneratorStep] = useState<'config' | 'generating' | 'results'>('config');
-  const [sourceVideo, setSourceVideo] = useState<SourceVideo | null>(SAMPLE_VIDEOS[0]);
+  const [sourceVideo, setSourceVideo] = useState<SourceVideo | null>(null);
   const [variantConfig, setVariantConfig] = useState<VariantConfig>({
     variantCount: 5,
-    mode: 'manual',
-    preset: 'social-media',
+    mode: 'randomized',
     format: '9:16',
     quality: 'high',
     adjustments: DEFAULT_ADJUSTMENTS,
     optionalElements: DEFAULT_OPTIONAL_ELEMENTS,
+    metadataTemplate: DEFAULT_METADATA_TEMPLATE,
   });
 
-  // Active Job & Results
   const [activeJob, setActiveJob] = useState<GenerationJob | null>(null);
   const [generatedVariants, setGeneratedVariants] = useState<GeneratedVariant[]>([]);
   const [previewingVariant, setPreviewingVariant] = useState<GeneratedVariant | null>(null);
-
-  // App Data & History State with LocalStorage
-  const [projects, setProjects] = useState<Project[]>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEYS.PROJECTS);
-      return saved ? JSON.parse(saved) : INITIAL_PROJECTS;
-    } catch {
-      return INITIAL_PROJECTS;
-    }
-  });
-
-  const [history, setHistory] = useState<GenerationJob[]>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEYS.HISTORY);
-      return saved ? JSON.parse(saved) : INITIAL_HISTORY;
-    } catch {
-      return INITIAL_HISTORY;
-    }
-  });
-
-  const [settings, setSettings] = useState<AppSettings>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEYS.SETTINGS);
-      if (saved) return JSON.parse(saved);
-    } catch {}
-    return {
-      defaultFormat: '9:16',
-      defaultQuality: 'high',
-      defaultVariantCount: 5,
-      outputFolder: 'downloads/variants',
-      backendApiUrl: 'http://localhost:8000/api/v1/generate-variants',
-      backendConnected: true,
-      hardwareAcceleration: 'cpu',
-      exportNamingPattern: '{filename}_var_{variant_num}_{ratio}.mp4',
-      autoZipOnComplete: false,
-      concurrentThreads: 4,
-      soundNotifications: true,
-    };
-  });
-
-  // Toast Notifications
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
-
-  // Timer Ref for Generation Simulation
-  const jobIntervalRef = useRef<number | null>(null);
-
-  // Sync to LocalStorage
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.PROJECTS, JSON.stringify(projects));
-  }, [projects]);
-
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.HISTORY, JSON.stringify(history));
-  }, [history]);
-
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.SETTINGS, JSON.stringify(settings));
-  }, [settings]);
+  const runtimeRef = useRef<{
+    paused: boolean;
+    cancelled: boolean;
+  }>({ paused: false, cancelled: false });
 
   const addToast = (type: ToastMessage['type'], title: string, message: string) => {
     const id = `toast-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`;
@@ -132,62 +85,42 @@ export default function App() {
     setToasts((prev) => prev.filter((t) => t.id !== id));
   };
 
-  // Start Generation Action
-  const handleStartGeneration = () => {
+  const revokeVariantMedia = (variants: GeneratedVariant[], keepSourceUrl?: string) => {
+    for (const variant of variants) {
+      if (variant.videoUrl && variant.videoUrl !== keepSourceUrl) {
+        revokeIfBlob(variant.videoUrl);
+      }
+    }
+  };
+
+  const replaceSourceVideo = (video: SourceVideo | null) => {
+    setSourceVideo((prev) => {
+      if (prev && prev.url !== video?.url) {
+        revokeIfBlob(prev.url);
+      }
+      return video;
+    });
+  };
+
+  const handleStartGeneration = async () => {
     if (!sourceVideo) {
       addToast('warning', 'No Video Selected', 'Please select or upload a video first.');
       return;
     }
 
+    revokeVariantMedia(generatedVariants, sourceVideo.url);
+    setGeneratedVariants([]);
+    setPreviewingVariant(null);
+
     const count = variantConfig.variantCount;
-    const isRandomized = variantConfig.mode === 'randomized';
-
-    // Prepare initial variant list
-    const initialVariants: GeneratedVariant[] = Array.from({ length: count }, (_, i) => {
-      const variantNumber = i + 1;
-      let adj = { ...variantConfig.adjustments };
-      let fmt = variantConfig.format;
-      let qual = variantConfig.quality;
-
-      if (isRandomized) {
-        adj = generateRandomizedAdjustments(adj, i);
-      } else if (variantConfig.mode === 'preset' && variantConfig.preset === 'social-media') {
-        const fmtCycle: any[] = ['9:16', '1:1', '4:5', '16:9'];
-        fmt = fmtCycle[i % fmtCycle.length];
-      }
-
-      const res = getResolutionForFormat(fmt, qual);
-      const durSec = Math.round(sourceVideo.duration / (adj.playbackSpeed || 1.0));
-      const durLabel = `00:${durSec < 10 ? '0' + durSec : durSec}`;
-      const sizeMb = (
-        (sourceVideo.size / (1024 * 1024)) *
-        (qual === 'compressed' ? 0.35 : qual === 'medium' ? 0.65 : 0.9) /
-        (adj.playbackSpeed || 1.0)
-      ).toFixed(1);
-
-      const outName = `${sourceVideo.name.replace(/\.[^/.]+$/, '')}_var_${variantNumber.toString().padStart(2, '0')}.mp4`;
-      const cmd = generateFFmpegCommand(sourceVideo.name, outName, adj, fmt, qual, variantConfig.optionalElements);
-
-      return {
-        id: `var-${Date.now()}-${variantNumber}`,
-        variantNumber,
-        title: `Variant #${variantNumber} (${fmt})`,
-        resolution: res.label,
-        aspectRatio: fmt,
-        duration: durLabel,
-        fileSize: `${sizeMb} MB`,
-        format: 'MP4 (H.264)',
-        quality: qual,
-        adjustments: adj,
-        optionalElements: variantConfig.optionalElements,
-        status: i === 0 ? 'processing' : 'queued',
-        progress: i === 0 ? 10 : 0,
-        currentStage: i === 0 ? 'Processing video' : 'Queued',
-        thumbnail: sourceVideo.thumbnailUrl,
-        videoUrl: sourceVideo.url,
-        ffmpegCommand: cmd,
-      };
-    });
+    const initialVariants: GeneratedVariant[] = buildInitialVariants(sourceVideo, variantConfig).map(
+      (variant, index) => ({
+        ...variant,
+        status: 'queued',
+        progress: 0,
+        currentStage: index === 0 ? 'Loading encoder' : 'Queued',
+      })
+    );
 
     const newJob: GenerationJob = {
       id: `job-${Date.now()}`,
@@ -196,167 +129,349 @@ export default function App() {
       sourceVideo,
       variantCount: count,
       mode: variantConfig.mode,
-      presetName: variantConfig.mode === 'preset' ? variantConfig.preset : undefined,
       status: 'generating',
-      progress: 0,
+      progress: 1,
       activeVariantIndex: 0,
       variants: initialVariants,
       createdAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
     };
 
+    runtimeRef.current = { paused: false, cancelled: false };
     setActiveJob(newJob);
     setGeneratorStep('generating');
-    addToast('info', 'Started Generation', `Generating ${count} video variants.`);
+    addToast('info', 'Started Generation', `Encoding ${count} video variants in your browser.`);
 
-    // Simulation engine
-    let currentIdx = 0;
-    let variantProg = 10;
-    const stages = [
-      'Cropping & Scaling',
-      'Adjusting Color',
-      'Applying Rotation',
-      'Rendering Overlays',
-      'Encoding MP4',
-    ];
+    const variants: GeneratedVariant[] = initialVariants.map((variant) => ({ ...variant }));
+    const startedAt = Date.now();
+    const inputName = inputFilenameFor(sourceVideo);
+    const jobPatchRef = { current: {} as Partial<GenerationJob> };
+    let publishTimer: number | null = null;
 
-    if (jobIntervalRef.current) clearInterval(jobIntervalRef.current);
+    const flushJob = () => {
+      if (publishTimer) {
+        window.clearTimeout(publishTimer);
+        publishTimer = null;
+      }
+      const patch = jobPatchRef.current;
+      setActiveJob((prev) =>
+        prev && prev.id === newJob.id
+          ? { ...prev, variants: variants.map((variant) => ({ ...variant })), ...patch }
+          : prev
+      );
+    };
 
-    jobIntervalRef.current = window.setInterval(() => {
-      variantProg += 25;
+    const publish = (patch: Partial<GenerationJob>, immediate = false) => {
+      jobPatchRef.current = { ...jobPatchRef.current, ...patch };
+      if (immediate) {
+        flushJob();
+        return;
+      }
+      if (publishTimer != null) return;
+      publishTimer = window.setTimeout(flushJob, 120);
+    };
 
-      setActiveJob((prevJob) => {
-        if (!prevJob || prevJob.status !== 'generating') return prevJob;
+    try {
+      await getFFmpeg();
+      if (runtimeRef.current.cancelled) return;
 
-        const updatedVariants = [...prevJob.variants];
-        const currentVariant = updatedVariants[currentIdx];
+      const sourceBlob = await fetch(sourceVideo.url).then((res) => res.blob());
+      await writeInputFile(inputName, sourceBlob);
+      if (runtimeRef.current.cancelled) return;
 
-        if (variantProg < 100) {
-          const stageIndex = Math.min(stages.length - 1, Math.floor(variantProg / 20));
-          if (currentVariant) {
-            currentVariant.status = 'processing';
-            currentVariant.progress = variantProg;
-            currentVariant.currentStage = stages[stageIndex];
-          }
-        } else {
-          if (currentVariant) {
-            currentVariant.status = 'completed';
-            currentVariant.progress = 100;
-            currentVariant.currentStage = 'Completed';
-          }
-
-          currentIdx++;
-          variantProg = 0;
-
-          if (currentIdx < updatedVariants.length) {
-            updatedVariants[currentIdx].status = 'processing';
-            updatedVariants[currentIdx].progress = 15;
-            updatedVariants[currentIdx].currentStage = stages[0];
-          }
+      for (let i = 0; i < variants.length; i++) {
+        while (runtimeRef.current.paused && !runtimeRef.current.cancelled) {
+          await sleep(200);
         }
+        if (runtimeRef.current.cancelled) return;
 
-        const overallProg = Math.min(100, Math.round(((currentIdx * 100 + variantProg) / (updatedVariants.length * 100)) * 100));
+        variants[i] = {
+          ...variants[i],
+          status: 'processing',
+          progress: 4,
+          currentStage: 'Encoding MP4',
+        };
+        publish(
+          {
+            status: 'generating',
+            progress: Math.round((i / variants.length) * 100),
+            activeVariantIndex: i,
+          },
+          true
+        );
 
-        if (currentIdx >= updatedVariants.length) {
-          if (jobIntervalRef.current) clearInterval(jobIntervalRef.current);
+        await writeInputFile(inputName, sourceBlob);
+        if (runtimeRef.current.cancelled) return;
 
-          const completedJob: GenerationJob = {
-            ...prevJob,
+        const outName = `out_${variants[i].variantNumber.toString().padStart(2, '0')}.mp4`;
+        const args = generateFFmpegArgs(
+          inputName,
+          outName,
+          variants[i].adjustments,
+          variants[i].aspectRatio,
+          variants[i].quality,
+          variants[i].optionalElements,
+          variants[i].metadata,
+          {
+            preset: 'ultrafast',
+            includeDrawtext: false,
+            source: sourceVideo.resolution,
+            wasmSafe: true,
+          }
+        );
+
+        try {
+          const runEncode = (encodeArgs: string[]) =>
+            encodeToBlob(
+              encodeArgs,
+              outName,
+              (ratio) => {
+                if (runtimeRef.current.cancelled) return;
+                variants[i] = {
+                  ...variants[i],
+                  status: 'processing',
+                  progress: Math.round(4 + ratio * 90),
+                  currentStage: ratio < 0.02 ? 'Starting encode' : 'Encoding MP4',
+                };
+                publish({
+                  status: 'generating',
+                  progress: Math.round(((i + ratio) / variants.length) * 100),
+                  activeVariantIndex: i,
+                });
+              },
+              {
+                durationSeconds: sourceVideo.duration / (variants[i].adjustments.playbackSpeed || 1),
+                onLog: (message) => {
+                  if (runtimeRef.current.cancelled) return;
+                  if (!/frame=|time=/.test(message)) return;
+                  variants[i] = {
+                    ...variants[i],
+                    status: 'processing',
+                    currentStage: message.length > 48 ? `${message.slice(0, 48)}…` : message,
+                  };
+                  publish({
+                    status: 'generating',
+                    activeVariantIndex: i,
+                  });
+                },
+              }
+            );
+
+          const fallbackArgs = [
+            generateFFmpegArgsWithoutAudio(args),
+            generateMinimalWasmArgs(
+              inputName,
+              outName,
+              variants[i].aspectRatio,
+              variants[i].quality,
+              sourceVideo.resolution
+            ),
+          ];
+
+          const encodeWithFallback = async () => {
+            try {
+              return await runEncode(args);
+            } catch {
+              for (const nextArgs of fallbackArgs) {
+                await writeInputFile(inputName, sourceBlob);
+                try {
+                  return await runEncode(nextArgs);
+                } catch {
+                  // Try the next simpler command.
+                }
+              }
+              throw new Error('All encode attempts failed');
+            }
+          };
+
+          let encoded: Blob;
+          try {
+            encoded = await encodeWithFallback();
+          } catch {
+            variants[i] = {
+              ...variants[i],
+              currentStage: 'Restarting encoder',
+            };
+            publish({ status: 'generating', activeVariantIndex: i }, true);
+            await recoverEncoder(inputName, sourceBlob);
+            encoded = await encodeWithFallback();
+          }
+
+          if (runtimeRef.current.cancelled) return;
+
+          const metadata = variants[i].metadata || buildVariantMetadata(variants[i].variantNumber);
+          const spoofed = await applyMetadataSpoof(encoded, metadata);
+          const objectUrl = URL.createObjectURL(spoofed);
+
+          variants[i] = {
+            ...variants[i],
             status: 'completed',
             progress: 100,
-            activeVariantIndex: updatedVariants.length,
-            variants: updatedVariants,
-            completedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-            totalRenderTimeMs: count * 1500,
+            currentStage: 'Completed',
+            outputBlob: spoofed,
+            videoUrl: objectUrl,
+            fileSize: formatBytes(spoofed.size),
+            metadata,
           };
-
-          const newProject: Project = {
-            id: completedJob.projectId,
-            name: completedJob.projectName,
-            description: `Generated ${count} variants (${completedJob.mode} mode).`,
-            sourceVideo: completedJob.sourceVideo,
-            variantCount: count,
-            createdAt: new Date().toLocaleDateString() + ' ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-            lastModified: 'Just now',
-            status: 'completed',
-            variants: updatedVariants,
-            config: variantConfig,
+          publish(
+            {
+              status: 'generating',
+              progress: Math.round(((i + 1) / variants.length) * 100),
+              activeVariantIndex: i,
+            },
+            true
+          );
+          await sleep(160);
+        } catch (error) {
+          if (runtimeRef.current.cancelled) return;
+          const message = error instanceof Error ? error.message : 'Encode failed';
+          variants[i] = {
+            ...variants[i],
+            status: 'failed',
+            progress: 0,
+            currentStage: 'Failed',
+            error: message,
           };
-
-          setProjects((prev) => [newProject, ...prev]);
-          setHistory((prev) => [completedJob, ...prev]);
-          setGeneratedVariants(updatedVariants);
-
-          try {
-            confetti({
-              particleCount: 50,
-              spread: 60,
-              origin: { y: 0.6 },
-            });
-          } catch {}
-
-          addToast('success', 'Generation Completed', `Created ${count} video variants.`);
-
-          setTimeout(() => {
-            setGeneratorStep('results');
-          }, 400);
-
-          return completedJob;
+          publish(
+            {
+              status: 'generating',
+              progress: Math.round(((i + 1) / variants.length) * 100),
+              activeVariantIndex: i,
+            },
+            true
+          );
+          await sleep(160);
         }
+      }
 
-        return {
-          ...prevJob,
-          progress: overallProg,
-          activeVariantIndex: currentIdx,
-          variants: updatedVariants,
-        };
-      });
-    }, 200);
+      await deleteInputFile(inputName);
+      if (runtimeRef.current.cancelled) return;
+
+      const completed = variants.filter((variant) => variant.status === 'completed').length;
+      const completedJob: GenerationJob = {
+        ...newJob,
+        status: completed > 0 ? 'completed' : 'failed',
+        progress: 100,
+        activeVariantIndex: variants.length,
+        variants,
+        completedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        totalRenderTimeMs: Date.now() - startedAt,
+      };
+
+      setActiveJob(completedJob);
+      setGeneratedVariants(variants.filter((variant) => variant.outputBlob));
+
+      if (completed > 0) {
+        try {
+          confetti({
+            particleCount: 50,
+            spread: 60,
+            origin: { y: 0.6 },
+          });
+        } catch {}
+        addToast('success', 'Generation Completed', `Encoded ${completed} of ${count} video variants.`);
+        await sleep(900);
+        if (!runtimeRef.current.cancelled) setGeneratorStep('results');
+      } else {
+        addToast('error', 'Generation Failed', 'The encoder could not create any variants.');
+      }
+    } catch (error) {
+      if (runtimeRef.current.cancelled) return;
+      const message = error instanceof Error ? error.message : 'Could not start the encoder.';
+      setActiveJob((prev) => (prev ? { ...prev, status: 'failed' } : prev));
+      addToast('error', 'Encoder Failed', message);
+    }
   };
 
   const handlePauseResumeJob = () => {
-    if (!activeJob) return;
+    if (!activeJob || (activeJob.status !== 'generating' && activeJob.status !== 'paused')) return;
     const newStatus = activeJob.status === 'paused' ? 'generating' : 'paused';
+    runtimeRef.current.paused = newStatus === 'paused';
     setActiveJob({ ...activeJob, status: newStatus });
-    addToast('info', 'Status Updated', `Job is now ${newStatus}.`);
+    addToast(
+      'info',
+      'Status Updated',
+      newStatus === 'paused'
+        ? 'Pause will apply after the current variant finishes.'
+        : 'Job is now generating.'
+    );
   };
 
   const handleCancelJob = () => {
-    if (jobIntervalRef.current) clearInterval(jobIntervalRef.current);
+    runtimeRef.current.cancelled = true;
+    runtimeRef.current.paused = false;
+    terminateFFmpeg();
     setActiveJob(null);
     setGeneratorStep('config');
     addToast('warning', 'Generation Cancelled', 'Active job was cancelled.');
   };
 
-  // Download Single Variant
-  const handleDownloadVariant = (variant: GeneratedVariant) => {
+  const getSpoofedBlob = async (variant: GeneratedVariant) => {
+    if (variant.outputBlob) return variant.outputBlob;
+    const sourceUrl = variant.videoUrl || sourceVideo?.url;
+    if (!sourceUrl) throw new Error('No source video');
+    const original = await fetch(sourceUrl).then((res) => res.blob());
+    const metadata = variant.metadata || buildVariantMetadata(variant.variantNumber);
+    return applyMetadataSpoof(original, metadata);
+  };
+
+  const triggerDownload = (blob: Blob, filename: string) => {
+    const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = variant.videoUrl;
-    a.download = `${sourceVideo?.name.replace(/\.[^/.]+$/, '') || 'video'}_variant_${variant.variantNumber}.mp4`;
+    a.href = url;
+    a.download = filename;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    addToast('info', 'Download Started', `Downloading Variant #${variant.variantNumber}.`);
+    window.setTimeout(() => URL.revokeObjectURL(url), 2000);
   };
 
-  // Download All Variants
-  const handleDownloadAll = () => {
-    if (generatedVariants.length === 0) return;
-    addToast('info', 'Downloading All', `Downloading ${generatedVariants.length} files.`);
-    generatedVariants.forEach((v, index) => {
-      setTimeout(() => {
-        const a = document.createElement('a');
-        a.href = v.videoUrl;
-        a.download = `variant_${v.variantNumber.toString().padStart(2, '0')}_${v.aspectRatio}.mp4`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-      }, index * 200);
-    });
+  const handleUpdateVariantMetadata = (variantId: string, metadata: GeneratedVariant['metadata']) => {
+    const apply = (variant: GeneratedVariant): GeneratedVariant => {
+      if (variant.id !== variantId) return variant;
+      const outName = `${(sourceVideo?.name || 'video').replace(/\.[^/.]+$/, '')}_var_${variant.variantNumber
+        .toString()
+        .padStart(2, '0')}.mp4`;
+      return {
+        ...variant,
+        metadata,
+        ffmpegCommand: generateFFmpegCommand(
+          sourceVideo?.name || 'input.mp4',
+          outName,
+          variant.adjustments,
+          variant.aspectRatio,
+          variant.quality,
+          variant.optionalElements,
+          metadata,
+          sourceVideo ? { source: sourceVideo.resolution } : undefined
+        ),
+      };
+    };
+
+    setGeneratedVariants((prev) => prev.map(apply));
+    setActiveJob((prev) => (prev ? { ...prev, variants: prev.variants.map(apply) } : prev));
+    setPreviewingVariant((prev) => (prev ? apply(prev) : prev));
   };
 
-  // Create ZIP Archive
-  const handleCreateZip = async () => {
-    if (generatedVariants.length === 0) return;
+  const handleDownloadVariant = async (variant: GeneratedVariant) => {
+    if (variant.status === 'failed' || !variant.outputBlob) {
+      addToast('error', 'Download Failed', 'This variant was not encoded.');
+      return;
+    }
+    try {
+      const blob = await getSpoofedBlob(variant);
+      triggerDownload(
+        blob,
+        `${sourceVideo?.name.replace(/\.[^/.]+$/, '') || 'video'}_variant_${variant.variantNumber}.mp4`
+      );
+      addToast('info', 'Download Started', `Downloading Variant #${variant.variantNumber}.`);
+    } catch {
+      addToast('error', 'Download Failed', 'Could not prepare this variant.');
+    }
+  };
+
+  const handleDownloadAll = async () => {
+    const ready = generatedVariants.filter((variant) => variant.outputBlob);
+    if (ready.length === 0) return;
 
     addToast('info', 'Packaging ZIP', 'Creating variants ZIP archive...');
     try {
@@ -367,28 +482,39 @@ export default function App() {
         app: 'Video Variant Generator',
         sourceVideo: sourceVideo?.name,
         generatedAt: new Date().toISOString(),
-        totalVariants: generatedVariants.length,
-        variants: generatedVariants.map((v) => ({
+        totalVariants: ready.length,
+        variants: ready.map((v) => ({
           variantNumber: v.variantNumber,
           resolution: v.resolution,
           aspectRatio: v.aspectRatio,
           duration: v.duration,
           fileSize: v.fileSize,
           adjustments: v.adjustments,
+          metadata: v.metadata,
           ffmpegCommand: v.ffmpegCommand,
         })),
       };
 
       folder?.file('manifest.json', JSON.stringify(manifest, null, 2));
 
-      const bashScript = `#!/bin/bash\n# FFmpeg Batch Execution Script\n\n` +
-        generatedVariants.map((v) => v.ffmpegCommand).join('\n\n');
+      const bashScript =
+        `#!/bin/bash\n# FFmpeg Batch Execution Script\n\n` +
+        ready.map((v) => v.ffmpegCommand).join('\n\n');
       folder?.file('generate_all.sh', bashScript);
+
+      for (const v of ready) {
+        const encoded = await getSpoofedBlob(v);
+        const safeRatio = String(v.aspectRatio).replace(':', 'x');
+        folder?.file(
+          `variant_${v.variantNumber.toString().padStart(2, '0')}_${safeRatio}.mp4`,
+          encoded
+        );
+      }
 
       const content = await zip.generateAsync({ type: 'blob' });
       const a = document.createElement('a');
       a.href = URL.createObjectURL(content);
-      a.download = `video_variants_${generatedVariants.length}_files.zip`;
+      a.download = `video_variants_${ready.length}_files.zip`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -399,216 +525,110 @@ export default function App() {
     }
   };
 
-  const handleOpenProjectInStudio = (project: Project) => {
-    setSourceVideo(project.sourceVideo);
-    setVariantConfig(project.config || variantConfig);
-    setGeneratedVariants(project.variants || []);
-    setGeneratorStep(project.variants && project.variants.length > 0 ? 'results' : 'config');
-    setActivePage('generator');
-    addToast('info', 'Project Loaded', `Opened "${project.name}".`);
-  };
-
-  const handleOpenJobInStudio = (job: GenerationJob) => {
-    setSourceVideo(job.sourceVideo);
-    setGeneratedVariants(job.variants || []);
-    setGeneratorStep('results');
-    setActivePage('generator');
-    addToast('info', 'Job Loaded', `Loaded ${job.variantCount} variants from history.`);
-  };
-
-  const handleDeleteProject = (projectId: string) => {
-    setProjects((prev) => prev.filter((p) => p.id !== projectId));
-    addToast('info', 'Project Deleted', 'Project removed from list.');
-  };
-
   return (
     <div id="video-variant-generator-app" className="flex h-screen w-screen bg-zinc-950 text-zinc-100 font-sans antialiased overflow-hidden select-none">
-      {/* Left Sidebar */}
-      <Sidebar
-        activePage={activePage}
-        onSelectPage={(page) => setActivePage(page)}
-        activeJobCount={activeJob && activeJob.status === 'generating' ? 1 : 0}
-      />
-
-      {/* Main Workspace */}
       <div className="flex-1 flex flex-col h-screen overflow-hidden">
-        {/* Header */}
         <Header
-          activePage={activePage}
-          onNavigateToGenerator={
-            activePage !== 'generator'
-              ? () => {
-                  setActivePage('generator');
-                  setGeneratorStep('config');
-                }
-              : undefined
-          }
           activeProjectName={sourceVideo ? sourceVideo.name : undefined}
           hasActiveJob={activeJob?.status === 'generating'}
         />
 
-        {/* Content */}
         <main className="flex-1 overflow-y-auto p-6">
-          {activePage === 'dashboard' && (
-            <DashboardView
-              projects={projects}
-              history={history}
-              onStartNewJob={() => {
-                setActivePage('generator');
-                setGeneratorStep('config');
-              }}
-              onOpenProject={handleOpenProjectInStudio}
-            />
-          )}
+          <div className="space-y-6 max-w-5xl mx-auto pb-10">
+            <div className="flex items-center gap-2 p-1 rounded-lg bg-zinc-900 border border-zinc-800 text-xs font-medium w-fit">
+              <button
+                onClick={() => setGeneratorStep('config')}
+                className={`px-3 py-1.5 rounded-md transition-colors ${
+                  generatorStep === 'config'
+                    ? 'bg-zinc-800 text-zinc-100'
+                    : 'text-zinc-400 hover:text-zinc-200'
+                }`}
+              >
+                1. Setup & Config
+              </button>
 
-          {activePage === 'generator' && (
-            <div className="space-y-6 max-w-5xl mx-auto pb-10">
-              {/* Step Navigation Tabs */}
-              <div className="flex items-center gap-2 p-1 rounded-lg bg-zinc-900 border border-zinc-800 text-xs font-medium w-fit">
-                <button
-                  onClick={() => setGeneratorStep('config')}
-                  className={`px-3 py-1.5 rounded-md transition-colors ${
-                    generatorStep === 'config'
-                      ? 'bg-zinc-800 text-zinc-100'
-                      : 'text-zinc-400 hover:text-zinc-200'
-                  }`}
-                >
-                  1. Setup & Config
-                </button>
+              <button
+                disabled={!activeJob}
+                onClick={() => activeJob && setGeneratorStep('generating')}
+                className={`px-3 py-1.5 rounded-md transition-colors ${
+                  generatorStep === 'generating'
+                    ? 'bg-zinc-800 text-zinc-100'
+                    : !activeJob
+                    ? 'text-zinc-600 cursor-not-allowed'
+                    : 'text-zinc-400 hover:text-zinc-200'
+                }`}
+              >
+                2. Progress
+              </button>
 
-                <button
-                  disabled={!activeJob}
-                  onClick={() => activeJob && setGeneratorStep('generating')}
-                  className={`px-3 py-1.5 rounded-md transition-colors ${
-                    generatorStep === 'generating'
-                      ? 'bg-zinc-800 text-zinc-100'
-                      : !activeJob
-                      ? 'text-zinc-600 cursor-not-allowed'
-                      : 'text-zinc-400 hover:text-zinc-200'
-                  }`}
-                >
-                  2. Progress
-                </button>
-
-                <button
-                  disabled={generatedVariants.length === 0}
-                  onClick={() => generatedVariants.length > 0 && setGeneratorStep('results')}
-                  className={`px-3 py-1.5 rounded-md transition-colors ${
-                    generatorStep === 'results'
-                      ? 'bg-zinc-800 text-zinc-100'
-                      : generatedVariants.length === 0
-                      ? 'text-zinc-600 cursor-not-allowed'
-                      : 'text-zinc-400 hover:text-zinc-200'
-                  }`}
-                >
-                  3. Results ({generatedVariants.length})
-                </button>
-              </div>
-
-              {/* Sub-View: Config & Upload */}
-              {generatorStep === 'config' && (
-                <div className="space-y-6">
-                  <UploadSection
-                    sourceVideo={sourceVideo}
-                    onVideoSelected={(vid) => {
-                      setSourceVideo(vid);
-                      addToast('info', 'Video Selected', `Loaded "${vid.name}".`);
-                    }}
-                    onClearVideo={() => setSourceVideo(null)}
-                  />
-
-                  {sourceVideo && (
-                    <VariantConfigPanel
-                      config={variantConfig}
-                      onChangeConfig={(updated) => setVariantConfig(updated)}
-                      onGenerate={handleStartGeneration}
-                      isGenerating={activeJob?.status === 'generating'}
-                    />
-                  )}
-                </div>
-              )}
-
-              {/* Sub-View: Live Generation Progress */}
-              {generatorStep === 'generating' && activeJob && (
-                <GenerationProgress
-                  job={activeJob}
-                  onPauseResume={handlePauseResumeJob}
-                  onCancel={handleCancelJob}
-                />
-              )}
-
-              {/* Sub-View: Results Grid */}
-              {generatorStep === 'results' && (
-                <ResultsGrid
-                  variants={generatedVariants}
-                  onPreviewVariant={(variant) => setPreviewingVariant(variant)}
-                  onDownloadVariant={handleDownloadVariant}
-                  onDownloadAll={handleDownloadAll}
-                  onExportZip={handleCreateZip}
-                  onNewGeneration={() => setGeneratorStep('config')}
-                />
-              )}
+              <button
+                disabled={generatedVariants.length === 0}
+                onClick={() => generatedVariants.length > 0 && setGeneratorStep('results')}
+                className={`px-3 py-1.5 rounded-md transition-colors ${
+                  generatorStep === 'results'
+                    ? 'bg-zinc-800 text-zinc-100'
+                    : generatedVariants.length === 0
+                    ? 'text-zinc-600 cursor-not-allowed'
+                    : 'text-zinc-400 hover:text-zinc-200'
+                }`}
+              >
+                3. Results ({generatedVariants.length})
+              </button>
             </div>
-          )}
 
-          {activePage === 'projects' && (
-            <ProjectsView
-              projects={projects}
-              onOpenProject={handleOpenProjectInStudio}
-              onDeleteProject={handleDeleteProject}
-              onStartNewProject={() => {
-                setActivePage('generator');
-                setGeneratorStep('config');
-              }}
-              onDownloadProjectVariants={(project) => {
-                if (project.variants && project.variants.length > 0) {
-                  setGeneratedVariants(project.variants);
-                  setSourceVideo(project.sourceVideo);
-                  handleDownloadAll();
-                } else {
-                  addToast('warning', 'No Variants', 'No generated variants in this project.');
-                }
-              }}
-            />
-          )}
+            {generatorStep === 'config' && (
+              <div className="space-y-6">
+                <UploadSection
+                  sourceVideo={sourceVideo}
+                  onVideoSelected={(vid) => {
+                    replaceSourceVideo(vid);
+                    addToast('info', 'Video Selected', `Loaded "${vid.name}".`);
+                  }}
+                  onClearVideo={() => replaceSourceVideo(null)}
+                />
 
-          {activePage === 'history' && (
-            <HistoryView
-              history={history}
-              onOpenJobInStudio={handleOpenJobInStudio}
-              onDownloadAllVariants={(job) => {
-                if (job.variants && job.variants.length > 0) {
-                  setGeneratedVariants(job.variants);
-                  setSourceVideo(job.sourceVideo);
-                  handleDownloadAll();
-                }
-              }}
-            />
-          )}
+                {sourceVideo && (
+                  <VariantConfigPanel
+                    config={variantConfig}
+                    onChangeConfig={(updated) => setVariantConfig(updated)}
+                    onGenerate={handleStartGeneration}
+                    isGenerating={activeJob?.status === 'generating'}
+                  />
+                )}
+              </div>
+            )}
 
-          {activePage === 'settings' && (
-            <SettingsView
-              settings={settings}
-              onSaveSettings={(updated) => {
-                setSettings(updated);
-                addToast('success', 'Saved', 'Settings updated.');
-              }}
-            />
-          )}
+            {generatorStep === 'generating' && activeJob && (
+              <GenerationProgress
+                job={activeJob}
+                onPauseResume={handlePauseResumeJob}
+                onCancel={handleCancelJob}
+              />
+            )}
+
+            {generatorStep === 'results' && (
+              <ResultsGrid
+                variants={generatedVariants}
+                onPreviewVariant={(variant) => setPreviewingVariant(variant)}
+                onDownloadVariant={handleDownloadVariant}
+                onDownloadAll={handleDownloadAll}
+                onNewGeneration={() => setGeneratorStep('config')}
+              />
+            )}
+          </div>
         </main>
       </div>
 
-      {/* Interactive Variant Preview Modal */}
       {previewingVariant && sourceVideo && (
         <VariantPreviewModal
           variant={previewingVariant}
           sourceVideo={sourceVideo}
           onClose={() => setPreviewingVariant(null)}
           onDownload={handleDownloadVariant}
+          onChangeMetadata={(metadata) => handleUpdateVariantMetadata(previewingVariant.id, metadata)}
         />
       )}
 
-      {/* Global Toast Container */}
       <ToastContainer toasts={toasts} onDismiss={dismissToast} />
     </div>
   );

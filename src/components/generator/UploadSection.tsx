@@ -1,6 +1,6 @@
 import React, { useRef, useState } from 'react';
 import { SourceVideo } from '../../types';
-import { SAMPLE_VIDEOS } from '../../data/sampleVideos';
+import { formatClockDuration } from '../../utils/format';
 import {
   UploadCloud,
   Film,
@@ -10,6 +10,12 @@ import {
   VolumeX,
   RotateCcw,
 } from 'lucide-react';
+
+const FALLBACK_THUMBNAIL =
+  'data:image/svg+xml,' +
+  encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="480" height="270"><rect fill="#18181b" width="100%" height="100%"/></svg>'
+  );
 
 interface UploadSectionProps {
   sourceVideo: SourceVideo | null;
@@ -27,6 +33,8 @@ export const UploadSection: React.FC<UploadSectionProps> = ({
   const [isDragging, setIsDragging] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMuted, setIsMuted] = useState(true);
+  const [isReadingFile, setIsReadingFile] = useState(false);
+  const [readError, setReadError] = useState<string | null>(null);
 
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
@@ -39,60 +47,111 @@ export const UploadSection: React.FC<UploadSectionProps> = ({
   };
 
   const processFile = (file: File) => {
-    if (!file.type.startsWith('video/')) {
-      alert('Please select a valid video file (MP4, WebM, MOV).');
+    const looksLikeVideo = file.type.startsWith('video/') || /\.(mp4|webm|mov|m4v)$/i.test(file.name);
+    if (!looksLikeVideo) {
+      setReadError('Please select a valid video file (MP4, WebM, MOV).');
       return;
     }
+
+    setReadError(null);
+    setIsReadingFile(true);
 
     const videoUrl = URL.createObjectURL(file);
     const tempVideo = document.createElement('video');
     tempVideo.preload = 'metadata';
+    tempVideo.muted = true;
+    tempVideo.playsInline = true;
     tempVideo.src = videoUrl;
 
-    tempVideo.onloadedmetadata = () => {
-      const width = tempVideo.videoWidth || 1920;
-      const height = tempVideo.videoHeight || 1080;
-      const duration = tempVideo.duration || 10;
-      const mins = Math.floor(duration / 60);
-      const secs = Math.floor(duration % 60);
-      const formattedDuration = `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+    let emitted = false;
+    const fail = (message: string) => {
+      if (emitted) return;
+      emitted = true;
+      setIsReadingFile(false);
+      URL.revokeObjectURL(videoUrl);
+      setReadError(message);
+    };
+
+    const emitVideo = (thumbUrl: string) => {
+      if (emitted) return;
+      emitted = true;
+      setIsReadingFile(false);
+
+      const width = tempVideo.videoWidth || 0;
+      const height = tempVideo.videoHeight || 0;
+      if (!width || !height) {
+        URL.revokeObjectURL(videoUrl);
+        setReadError('Could not read video dimensions. Try another MP4, WebM, or MOV.');
+        return;
+      }
+
+      const duration = Number.isFinite(tempVideo.duration) ? tempVideo.duration : 0;
       const sizeMb = (file.size / (1024 * 1024)).toFixed(1);
+      const bitrate = duration > 0 ? `${((file.size * 8) / (duration * 1000000)).toFixed(1)} Mbps` : '—';
 
-      // Generate a canvas thumbnail
-      const canvas = document.createElement('canvas');
-      canvas.width = Math.min(width, 480);
-      canvas.height = Math.min(height, 270);
-      tempVideo.currentTime = Math.min(1.0, duration / 2);
-
-      tempVideo.onseeked = () => {
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
-          ctx.drawImage(tempVideo, 0, 0, canvas.width, canvas.height);
-          const thumbUrl = canvas.toDataURL('image/jpeg', 0.8);
-
-          const newVideo: SourceVideo = {
-            id: `usr-${Date.now()}`,
-            name: file.name,
-            size: file.size,
-            formattedSize: `${sizeMb} MB`,
-            duration,
-            formattedDuration,
-            resolution: {
-              width,
-              height,
-              label: `${width}x${height} (${width > height ? '16:9' : width < height ? '9:16' : '1:1'})`,
-            },
-            fps: 30,
-            bitrate: `${((file.size * 8) / (duration * 1000000)).toFixed(1)} Mbps`,
-            codec: file.type.includes('webm') ? 'WebM' : 'H.264',
-            audioChannels: 'Stereo',
-            url: videoUrl,
-            thumbnailUrl: thumbUrl || SAMPLE_VIDEOS[0].thumbnailUrl,
-            isSample: false,
-          };
-          onVideoSelected(newVideo);
-        }
+      const newVideo: SourceVideo = {
+        id: `usr-${Date.now()}`,
+        name: file.name,
+        size: file.size,
+        formattedSize: `${sizeMb} MB`,
+        duration,
+        formattedDuration: formatClockDuration(duration),
+        resolution: {
+          width,
+          height,
+          label: `${width}x${height} (${width > height ? '16:9' : width < height ? '9:16' : '1:1'})`,
+        },
+        fps: 30,
+        bitrate,
+        codec: file.type.includes('webm') ? 'WebM' : 'H.264',
+        audioChannels: 'Stereo',
+        url: videoUrl,
+        thumbnailUrl: thumbUrl || FALLBACK_THUMBNAIL,
       };
+      onVideoSelected(newVideo);
+    };
+
+    const captureThumbnail = () => {
+      try {
+        const width = tempVideo.videoWidth || 480;
+        const height = tempVideo.videoHeight || 270;
+        const maxEdge = 480;
+        const scale = Math.min(maxEdge / width, maxEdge / height, 1);
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.max(1, Math.round(width * scale));
+        canvas.height = Math.max(1, Math.round(height * scale));
+        const ctx = canvas.getContext('2d');
+        if (ctx && width > 0 && height > 0) {
+          ctx.drawImage(tempVideo, 0, 0, canvas.width, canvas.height);
+          emitVideo(canvas.toDataURL('image/jpeg', 0.8));
+          return;
+        }
+      } catch {
+        // Fall through to placeholder thumbnail
+      }
+      emitVideo(FALLBACK_THUMBNAIL);
+    };
+
+    tempVideo.onloadedmetadata = () => {
+      const duration = Number.isFinite(tempVideo.duration) ? tempVideo.duration : 0;
+      const seekTarget = duration > 0 ? Math.min(1, duration / 2) : 0;
+      window.setTimeout(() => {
+        if (!emitted) emitVideo(FALLBACK_THUMBNAIL);
+      }, 2000);
+      if (seekTarget === 0 || Math.abs(tempVideo.currentTime - seekTarget) < 0.05) {
+        captureThumbnail();
+        return;
+      }
+      tempVideo.onseeked = captureThumbnail;
+      try {
+        tempVideo.currentTime = seekTarget;
+      } catch {
+        captureThumbnail();
+      }
+    };
+
+    tempVideo.onerror = () => {
+      fail('Could not read this video file. Try MP4, WebM, or MOV.');
     };
   };
 
@@ -107,6 +166,7 @@ export const UploadSection: React.FC<UploadSectionProps> = ({
   const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
       processFile(e.target.files[0]);
+      e.target.value = '';
     }
   };
 
@@ -138,7 +198,7 @@ export const UploadSection: React.FC<UploadSectionProps> = ({
             <span>Source Video</span>
           </h2>
           <p className="text-xs text-zinc-400">
-            Upload your video file or choose a sample to begin generating variants.
+            Upload a video file to begin generating variants.
           </p>
         </div>
 
@@ -154,29 +214,29 @@ export const UploadSection: React.FC<UploadSectionProps> = ({
         )}
       </div>
 
+      <input
+        id="source-video-input"
+        ref={fileInputRef}
+        type="file"
+        accept="video/mp4,video/quicktime,video/webm,video/x-m4v"
+        className="hidden"
+        onChange={handleFileInputChange}
+      />
+
       {!sourceVideo ? (
-        <div className="space-y-4">
-          {/* Drag & Drop Card */}
+        <div className="space-y-2">
           <div
             id="drag-drop-zone"
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
             onDrop={handleDrop}
-            onClick={() => fileInputRef.current?.click()}
+            onClick={() => !isReadingFile && fileInputRef.current?.click()}
             className={`border border-dashed rounded-lg p-8 text-center cursor-pointer transition-colors ${
               isDragging
                 ? 'border-zinc-400 bg-zinc-900/80'
                 : 'border-zinc-800 hover:border-zinc-700 bg-zinc-900/40 hover:bg-zinc-900/60'
             }`}
           >
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="video/mp4,video/quicktime,video/webm"
-              className="hidden"
-              onChange={handleFileInputChange}
-            />
-
             <div className="flex flex-col items-center justify-center space-y-2">
               <div className="w-10 h-10 rounded-lg bg-zinc-900 border border-zinc-800 flex items-center justify-center text-zinc-400">
                 <UploadCloud className="w-5 h-5" />
@@ -184,7 +244,7 @@ export const UploadSection: React.FC<UploadSectionProps> = ({
 
               <div className="space-y-0.5">
                 <p className="text-xs font-medium text-zinc-200">
-                  Click to select or drag and drop video
+                  {isReadingFile ? 'Reading video…' : 'Click to select or drag and drop video'}
                 </p>
                 <p className="text-[11px] text-zinc-500 font-mono">
                   MP4, WebM, MOV
@@ -192,43 +252,11 @@ export const UploadSection: React.FC<UploadSectionProps> = ({
               </div>
             </div>
           </div>
-
-          {/* Sample Videos Grid */}
-          <div className="space-y-2">
-            <div className="text-xs font-medium text-zinc-400">
-              Or pick a sample video:
-            </div>
-
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-              {SAMPLE_VIDEOS.map((sample) => (
-                <button
-                  key={sample.id}
-                  id={`sample-video-btn-${sample.id}`}
-                  onClick={() => onVideoSelected(sample)}
-                  className="group flex flex-col text-left p-2 rounded-lg bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 hover:border-zinc-700 transition-colors"
-                >
-                  <div className="relative w-full aspect-video rounded overflow-hidden bg-black mb-2">
-                    <img
-                      src={sample.thumbnailUrl}
-                      alt={sample.name}
-                      referrerPolicy="no-referrer"
-                      className="w-full h-full object-cover"
-                    />
-                    <div className="absolute bottom-1 right-1 px-1 rounded bg-black/80 font-mono text-[9px] text-white">
-                      {sample.formattedDuration}
-                    </div>
-                  </div>
-
-                  <span className="text-xs font-medium text-zinc-300 truncate w-full">
-                    {sample.name.replace(/\.[^/.]+$/, '')}
-                  </span>
-                  <span className="text-[11px] text-zinc-500 font-mono mt-0.5">
-                    {sample.formattedSize}
-                  </span>
-                </button>
-              ))}
-            </div>
-          </div>
+          {readError && (
+            <p className="text-xs text-red-400" id="upload-error">
+              {readError}
+            </p>
+          )}
         </div>
       ) : (
         /* Video Selected Details Card */

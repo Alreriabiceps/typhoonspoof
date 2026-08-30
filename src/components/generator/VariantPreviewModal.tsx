@@ -1,5 +1,6 @@
 import React, { useRef, useState, useEffect } from 'react';
-import { GeneratedVariant, SourceVideo } from '../../types';
+import { GeneratedVariant, SourceVideo, VariantFileMetadata } from '../../types';
+import { getCssAspectRatio, isPortraitRatio } from '../../utils/format';
 import {
   X,
   Play,
@@ -19,6 +20,7 @@ interface VariantPreviewModalProps {
   sourceVideo: SourceVideo | null;
   onClose: () => void;
   onDownload: (variant: GeneratedVariant) => void;
+  onChangeMetadata?: (metadata: VariantFileMetadata) => void;
 }
 
 export const VariantPreviewModal: React.FC<VariantPreviewModalProps> = ({
@@ -26,6 +28,7 @@ export const VariantPreviewModal: React.FC<VariantPreviewModalProps> = ({
   sourceVideo,
   onClose,
   onDownload,
+  onChangeMetadata,
 }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -34,11 +37,16 @@ export const VariantPreviewModal: React.FC<VariantPreviewModalProps> = ({
   const [compareWithOriginal, setCompareWithOriginal] = useState(false);
 
   useEffect(() => {
-    if (variant && videoRef.current) {
+    if (!variant || !videoRef.current) return;
+    const encoded = Boolean(variant.outputBlob);
+    if (compareWithOriginal || encoded) {
+      videoRef.current.playbackRate = 1;
+      videoRef.current.volume = 1;
+    } else {
       videoRef.current.playbackRate = variant.adjustments.playbackSpeed || 1.0;
       videoRef.current.volume = Math.min(1, Math.max(0, (variant.adjustments.audioVolume || 100) / 100));
     }
-  }, [variant]);
+  }, [variant, compareWithOriginal]);
 
   if (!variant || !sourceVideo) return null;
 
@@ -50,9 +58,7 @@ export const VariantPreviewModal: React.FC<VariantPreviewModalProps> = ({
 
   const filterStyle = {
     filter: `brightness(${brightness}) contrast(${contrast}) saturate(${saturate}) hue-rotate(${hueRotate}deg)`,
-    transform: `rotate(${adj.rotation || 0}deg) scale(${(adj.zoomPercent || 100) / 100}) ${
-      adj.horizontalFlip ? 'scaleX(-1)' : ''
-    }`,
+    transform: `rotate(${adj.rotation || 0}deg) scale(${(adj.zoomPercent || 100) / 100})`,
   };
 
   const copyCommand = () => {
@@ -114,45 +120,33 @@ export const VariantPreviewModal: React.FC<VariantPreviewModalProps> = ({
         {/* Modal Body */}
         <div className="p-4 overflow-y-auto space-y-4">
           {/* Video Player Display */}
-          <div className="relative aspect-video bg-black rounded-md overflow-hidden flex items-center justify-center border border-zinc-800">
+          <div
+            className="relative bg-black rounded-md overflow-hidden flex items-center justify-center border border-zinc-800 mx-auto"
+            style={{
+              aspectRatio: compareWithOriginal
+                ? getCssAspectRatio('original', `${sourceVideo.resolution.width}x${sourceVideo.resolution.height}`)
+                : getCssAspectRatio(variant.aspectRatio, variant.resolution),
+              maxHeight: '56vh',
+              width: '100%',
+              maxWidth: !compareWithOriginal && isPortraitRatio(variant.aspectRatio) ? '320px' : '100%',
+            }}
+          >
             <video
               ref={videoRef}
-              src={sourceVideo.url}
-              className="w-full h-full object-contain transition-all"
-              style={compareWithOriginal ? undefined : filterStyle}
+              src={
+                compareWithOriginal || !variant.outputBlob
+                  ? sourceVideo.url
+                  : variant.videoUrl
+              }
+              className={`absolute inset-0 w-full h-full object-center transition-all ${
+                variant.outputBlob && !compareWithOriginal ? 'object-contain' : 'object-cover'
+              }`}
+              style={compareWithOriginal || variant.outputBlob ? undefined : filterStyle}
               loop
               muted={isMuted}
               onPlay={() => setIsPlaying(true)}
               onPause={() => setIsPlaying(false)}
             />
-
-            {/* Overlays */}
-            {!compareWithOriginal && variant.optionalElements?.textOverlay?.enabled && (
-              <div
-                className={`absolute left-4 right-4 text-center font-bold text-sm pointer-events-none drop-shadow-md ${
-                  variant.optionalElements.textOverlay.position === 'top'
-                    ? 'top-4'
-                    : variant.optionalElements.textOverlay.position === 'bottom'
-                    ? 'bottom-8'
-                    : 'top-1/2 -translate-y-1/2'
-                } ${
-                  variant.optionalElements.textOverlay.style === 'bold-yellow'
-                    ? 'text-yellow-300'
-                    : 'text-white'
-                }`}
-              >
-                {variant.optionalElements.textOverlay.text}
-              </div>
-            )}
-
-            {!compareWithOriginal && variant.optionalElements?.watermark?.enabled && (
-              <div
-                className="absolute bottom-3 right-4 font-mono text-xs text-white/80 pointer-events-none"
-                style={{ opacity: variant.optionalElements.watermark.opacity / 100 }}
-              >
-                {variant.optionalElements.watermark.text}
-              </div>
-            )}
 
             {/* Bottom Player Controls */}
             <div className="absolute bottom-2 left-2 right-2 flex items-center justify-between">
@@ -196,6 +190,38 @@ export const VariantPreviewModal: React.FC<VariantPreviewModalProps> = ({
               <span className="font-mono text-zinc-200">{variant.fileSize}</span>
             </div>
           </div>
+
+          {variant.metadata && (
+            <div className="space-y-2">
+              <div className="text-xs text-zinc-400">Spoofed metadata (written into the encoded file)</div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                {(
+                  [
+                    ['title', 'Title'],
+                    ['comment', 'Comment'],
+                    ['encoder', 'Encoder'],
+                    ['creationTime', 'Creation time'],
+                    ['uuid', 'UUID'],
+                  ] as const
+                ).map(([key, label]) => (
+                  <label key={key} className={key === 'uuid' || key === 'comment' ? 'sm:col-span-2 space-y-1' : 'space-y-1'}>
+                    <span className="text-[10px] text-zinc-500">{label}</span>
+                    <input
+                      type="text"
+                      value={variant.metadata[key]}
+                      onChange={(e) =>
+                        onChangeMetadata?.({
+                          ...variant.metadata,
+                          [key]: e.target.value,
+                        })
+                      }
+                      className="w-full px-2.5 py-1.5 rounded bg-zinc-950 border border-zinc-700 text-xs font-mono text-zinc-100"
+                    />
+                  </label>
+                ))}
+              </div>
+            </div>
+          )}
 
           {/* FFmpeg Command */}
           <div className="space-y-1.5">

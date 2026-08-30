@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { GeneratedVariant, AspectRatioFormat } from '../../types';
+import { getCssAspectRatio, isPortraitRatio } from '../../utils/format';
 import {
   Download,
   Eye,
@@ -15,7 +16,6 @@ interface ResultsGridProps {
   onPreviewVariant: (variant: GeneratedVariant) => void;
   onDownloadVariant: (variant: GeneratedVariant) => void;
   onDownloadAll: () => void;
-  onExportZip: () => void;
   onNewGeneration: () => void;
 }
 
@@ -24,7 +24,6 @@ export const ResultsGrid: React.FC<ResultsGridProps> = ({
   onPreviewVariant,
   onDownloadVariant,
   onDownloadAll,
-  onExportZip,
   onNewGeneration,
 }) => {
   const [formatFilter, setFormatFilter] = useState<string>('all');
@@ -45,9 +44,7 @@ export const ResultsGrid: React.FC<ResultsGridProps> = ({
     const hueRotate = (adj.colorTemperature || 0) * 0.8;
     return {
       filter: `brightness(${brightness}) contrast(${contrast}) saturate(${saturate}) hue-rotate(${hueRotate}deg)`,
-      transform: `rotate(${adj.rotation || 0}deg) scale(${(adj.zoomPercent || 100) / 100}) ${
-        adj.horizontalFlip ? 'scaleX(-1)' : ''
-      }`,
+      transform: `rotate(${adj.rotation || 0}deg) scale(${(adj.zoomPercent || 100) / 100})`,
     };
   };
 
@@ -76,20 +73,11 @@ export const ResultsGrid: React.FC<ResultsGridProps> = ({
           </button>
 
           <button
-            id="results-export-zip-btn"
-            onClick={onExportZip}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-medium border border-zinc-700 transition-colors"
-          >
-            <Archive className="w-3.5 h-3.5" />
-            <span>Export ZIP</span>
-          </button>
-
-          <button
             id="results-download-all-btn"
             onClick={onDownloadAll}
             className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-md bg-zinc-100 hover:bg-zinc-200 text-zinc-900 text-xs font-medium transition-colors"
           >
-            <Download className="w-3.5 h-3.5" />
+            <Archive className="w-3.5 h-3.5" />
             <span>Download All</span>
           </button>
         </div>
@@ -126,7 +114,13 @@ export const ResultsGrid: React.FC<ResultsGridProps> = ({
       )}
 
       {/* Variants Grid */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+      <div
+        className={`grid gap-4 ${
+          filteredVariants.every((v) => isPortraitRatio(v.aspectRatio))
+            ? 'grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5'
+            : 'grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4'
+        }`}
+      >
         {filteredVariants.map((variant) => {
           const adj = variant.adjustments;
 
@@ -139,42 +133,24 @@ export const ResultsGrid: React.FC<ResultsGridProps> = ({
               <div>
                 {/* Visual Preview Frame */}
                 <div
-                  className="relative w-full aspect-video bg-black overflow-hidden cursor-pointer"
+                  className="relative w-full bg-black overflow-hidden cursor-pointer"
+                  style={{
+                    aspectRatio: getCssAspectRatio(variant.aspectRatio, variant.resolution),
+                  }}
                   onClick={() => onPreviewVariant(variant)}
                 >
-                  <img
-                    src={variant.thumbnail}
-                    alt={variant.title}
-                    referrerPolicy="no-referrer"
-                    className="w-full h-full object-cover transition-transform"
-                    style={getPreviewFilterStyle(variant)}
-                  />
-
-                  {/* Overlays preview */}
-                  {variant.optionalElements?.textOverlay?.enabled && (
-                    <div
-                      className={`absolute left-2 right-2 text-center text-[10px] font-bold pointer-events-none drop-shadow ${
-                        variant.optionalElements.textOverlay.position === 'top'
-                          ? 'top-2'
-                          : variant.optionalElements.textOverlay.position === 'bottom'
-                          ? 'bottom-2'
-                          : 'top-1/2 -translate-y-1/2'
-                      } ${
-                        variant.optionalElements.textOverlay.style === 'bold-yellow'
-                          ? 'text-yellow-300'
-                          : 'text-white'
-                      }`}
-                    >
-                      {variant.optionalElements.textOverlay.text}
-                    </div>
-                  )}
-
-                  {variant.optionalElements?.watermark?.enabled && (
-                    <div
-                      className="absolute bottom-1 right-2 text-[9px] font-mono text-white/70 pointer-events-none"
-                      style={{ opacity: variant.optionalElements.watermark.opacity / 100 }}
-                    >
-                      {variant.optionalElements.watermark.text}
+                  {variant.outputBlob ? (
+                    <video
+                      src={variant.videoUrl}
+                      poster={variant.thumbnail}
+                      muted
+                      playsInline
+                      preload="metadata"
+                      className="absolute inset-0 w-full h-full object-contain object-center"
+                    />
+                  ) : (
+                    <div className="absolute inset-0 flex items-center justify-center text-[11px] text-red-300 bg-zinc-950">
+                      Encode failed
                     </div>
                   )}
 
@@ -236,7 +212,8 @@ export const ResultsGrid: React.FC<ResultsGridProps> = ({
                 <button
                   id={`download-variant-btn-${variant.id}`}
                   onClick={() => onDownloadVariant(variant)}
-                  className="p-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 hover:text-white border border-zinc-700 transition-colors"
+                  disabled={!variant.outputBlob}
+                  className="p-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 hover:text-white border border-zinc-700 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                   title="Download MP4"
                 >
                   <Download className="w-3.5 h-3.5" />

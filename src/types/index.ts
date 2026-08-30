@@ -1,9 +1,6 @@
-export type NavPage = 'dashboard' | 'generator' | 'projects' | 'history' | 'settings';
-
 export type AspectRatioFormat = 'original' | '16:9' | '9:16' | '1:1' | '4:5' | '21:9';
 export type QualityTier = 'original' | 'high' | 'medium' | 'compressed';
-export type VariationMode = 'manual' | 'randomized' | 'preset';
-export type PresetCategory = 'social-media' | 'vertical-short' | 'square-post' | 'high-quality' | 'lightweight';
+export type VariationMode = 'randomized' | 'manual';
 
 export interface SourceVideo {
   id: string;
@@ -45,21 +42,6 @@ export interface VideoAdjustments {
   speedRange?: [number, number];
 }
 
-export interface TextOverlayConfig {
-  enabled: boolean;
-  text: string;
-  position: 'top' | 'center' | 'bottom';
-  style: 'bold-yellow' | 'clean-white' | 'boxed-black' | 'neon-glow';
-  fontSize: number;
-}
-
-export interface WatermarkConfig {
-  enabled: boolean;
-  text: string;
-  opacity: number;
-  position: 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
-}
-
 export interface IntroOutroConfig {
   introEnabled: boolean;
   introTitle: string;
@@ -72,19 +54,31 @@ export interface IntroOutroConfig {
 }
 
 export interface OptionalElementsConfig {
-  textOverlay: TextOverlayConfig;
-  watermark: WatermarkConfig;
   introOutro: IntroOutroConfig;
+}
+
+export interface MetadataTemplate {
+  titlePattern: string;
+  commentPattern: string;
+  encoderPattern: string;
 }
 
 export interface VariantConfig {
   variantCount: number;
   mode: VariationMode;
-  preset: PresetCategory;
   format: AspectRatioFormat;
   quality: QualityTier;
   adjustments: VideoAdjustments;
   optionalElements: OptionalElementsConfig;
+  metadataTemplate: MetadataTemplate;
+}
+
+export interface VariantFileMetadata {
+  uuid: string;
+  title: string;
+  comment: string;
+  encoder: string;
+  creationTime: string;
 }
 
 export interface GeneratedVariant {
@@ -104,7 +98,9 @@ export interface GeneratedVariant {
   currentStage?: string;
   thumbnail: string;
   videoUrl: string;
+  outputBlob?: Blob;
   ffmpegCommand: string;
+  metadata: VariantFileMetadata;
   error?: string;
   renderTimeMs?: number;
 }
@@ -116,7 +112,6 @@ export interface GenerationJob {
   sourceVideo: SourceVideo;
   variantCount: number;
   mode: VariationMode;
-  presetName?: string;
   status: 'idle' | 'generating' | 'paused' | 'completed' | 'failed' | 'cancelled';
   progress: number; // 0 - 100
   activeVariantIndex: number;
@@ -124,33 +119,6 @@ export interface GenerationJob {
   createdAt: string;
   completedAt?: string;
   totalRenderTimeMs?: number;
-}
-
-export interface Project {
-  id: string;
-  name: string;
-  description: string;
-  sourceVideo: SourceVideo;
-  variantCount: number;
-  createdAt: string;
-  lastModified: string;
-  status: 'completed' | 'draft' | 'archived';
-  variants: GeneratedVariant[];
-  config: VariantConfig;
-}
-
-export interface AppSettings {
-  defaultFormat: AspectRatioFormat;
-  defaultQuality: QualityTier;
-  defaultVariantCount: number;
-  outputFolder: string;
-  backendApiUrl: string;
-  backendConnected: boolean;
-  hardwareAcceleration: 'auto' | 'nvenc' | 'qsv' | 'vaapi' | 'cpu';
-  exportNamingPattern: string;
-  autoZipOnComplete: boolean;
-  concurrentThreads: number;
-  soundNotifications: boolean;
 }
 
 export interface ToastMessage {

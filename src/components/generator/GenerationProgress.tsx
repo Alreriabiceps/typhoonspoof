@@ -15,6 +15,7 @@ export const GenerationProgress: React.FC<GenerationProgressProps> = ({
 }) => {
   const completedCount = job.variants.filter((v) => v.status === 'completed').length;
   const isPaused = job.status === 'paused';
+  const isComplete = job.status === 'completed';
 
   return (
     <div id="generation-progress-view" className="space-y-6 max-w-4xl mx-auto py-4">
@@ -23,31 +24,45 @@ export const GenerationProgress: React.FC<GenerationProgressProps> = ({
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div>
             <h2 className="text-sm font-semibold text-zinc-100 flex items-center gap-2">
-              <Loader2 className="w-4 h-4 text-zinc-400 animate-spin" />
-              <span>Generating Variants ({completedCount}/{job.variantCount})</span>
+              {isComplete ? (
+                <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+              ) : (
+                <Loader2 className={`w-4 h-4 text-zinc-400 ${isPaused ? '' : 'animate-spin'}`} />
+              )}
+              <span>
+                {isComplete
+                  ? `Generated ${job.variantCount} Variants`
+                  : isPaused
+                  ? `Paused (${completedCount}/${job.variantCount})`
+                  : `Generating Variants (${completedCount}/${job.variantCount})`}
+              </span>
             </h2>
             <p className="text-xs text-zinc-400 mt-0.5">
-              Processing &apos;{job.sourceVideo.name}&apos; into {job.variantCount} variations.
+              {isComplete
+                ? `Finished encoding ${job.variantCount} variants.`
+                : `Working on variant ${Math.min(job.variantCount, (job.activeVariantIndex || 0) + 1)} of ${job.variantCount}. First file is the slowest.`}
             </p>
           </div>
 
-          <div className="flex items-center gap-2">
-            <button
-              onClick={onPauseResume}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-medium border border-zinc-700 transition-colors"
-            >
-              {isPaused ? <Play className="w-3.5 h-3.5" /> : <Pause className="w-3.5 h-3.5" />}
-              <span>{isPaused ? 'Resume' : 'Pause'}</span>
-            </button>
+          {!isComplete && (
+            <div className="flex items-center gap-2">
+              <button
+                onClick={onPauseResume}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-medium border border-zinc-700 transition-colors"
+              >
+                {isPaused ? <Play className="w-3.5 h-3.5" /> : <Pause className="w-3.5 h-3.5" />}
+                <span>{isPaused ? 'Resume' : 'Pause'}</span>
+              </button>
 
-            <button
-              onClick={onCancel}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-red-950/40 hover:bg-red-900/50 text-red-400 text-xs font-medium border border-red-800/40 transition-colors"
-            >
-              <XCircle className="w-3.5 h-3.5" />
-              <span>Cancel</span>
-            </button>
-          </div>
+              <button
+                onClick={onCancel}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-red-950/40 hover:bg-red-900/50 text-red-400 text-xs font-medium border border-red-800/40 transition-colors"
+              >
+                <XCircle className="w-3.5 h-3.5" />
+                <span>Cancel</span>
+              </button>
+            </div>
+          )}
         </div>
 
         {/* Progress Bar */}
@@ -72,6 +87,7 @@ export const GenerationProgress: React.FC<GenerationProgressProps> = ({
         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
           {job.variants.map((v) => {
             const isDone = v.status === 'completed';
+            const isFailed = v.status === 'failed';
             const isProcessing = v.status === 'processing';
 
             return (
@@ -80,6 +96,8 @@ export const GenerationProgress: React.FC<GenerationProgressProps> = ({
                 className={`p-3 rounded-lg border flex flex-col justify-between space-y-2 transition-colors ${
                   isDone
                     ? 'bg-zinc-900 border-zinc-700'
+                    : isFailed
+                    ? 'bg-red-950/30 border-red-800/40'
                     : isProcessing
                     ? 'bg-zinc-900/80 border-zinc-500'
                     : 'bg-zinc-950/60 border-zinc-800/80 opacity-60'
@@ -96,7 +114,15 @@ export const GenerationProgress: React.FC<GenerationProgressProps> = ({
 
                 <div className="space-y-1">
                   <div className="flex justify-between text-[11px] text-zinc-400">
-                    <span>{isDone ? 'Completed' : isProcessing ? 'Rendering' : 'Queued'}</span>
+                    <span>
+                      {isDone
+                        ? 'Completed'
+                        : v.status === 'failed'
+                        ? 'Failed'
+                        : isProcessing
+                        ? v.currentStage || 'Encoding'
+                        : 'Queued'}
+                    </span>
                     <span className="font-mono">{v.progress}%</span>
                   </div>
 
