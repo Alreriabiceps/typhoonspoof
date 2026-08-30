@@ -145,7 +145,9 @@ export const ResultsGrid: React.FC<ResultsGridProps> = ({
                       poster={variant.thumbnail}
                       muted
                       playsInline
-                      preload="metadata"
+                      loop
+                      autoPlay
+                      preload="auto"
                       className="absolute inset-0 w-full h-full object-contain object-center"
                     />
                   ) : (

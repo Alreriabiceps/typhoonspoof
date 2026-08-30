@@ -1,6 +1,6 @@
 {
-  "name": "Video Variant Generator",
-  "description": "Create multiple customized versions from a single source video.",
+  "name": "Typhoon Agency Spoofer",
+  "description": "Create multiple customized versions from a single source video. Made by Benhur.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

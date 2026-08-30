@@ -119,8 +119,11 @@ export async function encodeToBlob(
     if (typeof data === 'string') {
       throw new Error('Encoder returned text instead of video bytes');
     }
+    const source = data instanceof Uint8Array ? data : new Uint8Array(data);
+    const copy = new Uint8Array(source.byteLength);
+    copy.set(source);
     onProgress?.(1);
-    return new Blob([data], { type: 'video/mp4' });
+    return new Blob([copy], { type: 'video/mp4' });
   } finally {
     instance.off('progress', handleProgress);
     instance.off('log', handleLog);

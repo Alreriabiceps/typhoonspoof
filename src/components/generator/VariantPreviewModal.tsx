@@ -73,8 +73,7 @@ export const VariantPreviewModal: React.FC<VariantPreviewModalProps> = ({
         videoRef.current.pause();
         setIsPlaying(false);
       } else {
-        videoRef.current.play();
-        setIsPlaying(true);
+        void videoRef.current.play().then(() => setIsPlaying(true)).catch(() => {});
       }
     }
   };
@@ -133,6 +132,7 @@ export const VariantPreviewModal: React.FC<VariantPreviewModalProps> = ({
           >
             <video
               ref={videoRef}
+              key={`${compareWithOriginal ? 'orig' : 'var'}-${variant.id}-${variant.videoUrl}`}
               src={
                 compareWithOriginal || !variant.outputBlob
                   ? sourceVideo.url
@@ -143,6 +143,9 @@ export const VariantPreviewModal: React.FC<VariantPreviewModalProps> = ({
               }`}
               style={compareWithOriginal || variant.outputBlob ? undefined : filterStyle}
               loop
+              playsInline
+              preload="auto"
+              controls
               muted={isMuted}
               onPlay={() => setIsPlaying(true)}
               onPause={() => setIsPlaying(false)}

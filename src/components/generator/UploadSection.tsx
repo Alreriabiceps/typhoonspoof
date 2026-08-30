@@ -176,8 +176,7 @@ export const UploadSection: React.FC<UploadSectionProps> = ({
         videoRef.current.pause();
         setIsPlaying(false);
       } else {
-        videoRef.current.play();
-        setIsPlaying(true);
+        void videoRef.current.play().then(() => setIsPlaying(true)).catch(() => {});
       }
     }
   };
@@ -266,9 +265,12 @@ export const UploadSection: React.FC<UploadSectionProps> = ({
             <div className="relative rounded overflow-hidden bg-black aspect-video flex items-center justify-center border border-zinc-800">
               <video
                 ref={videoRef}
+                key={sourceVideo.url}
                 src={sourceVideo.url}
                 className="w-full h-full object-contain"
                 loop
+                playsInline
+                preload="auto"
                 muted={isMuted}
                 onPlay={() => setIsPlaying(true)}
                 onPause={() => setIsPlaying(false)}

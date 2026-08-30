@@ -299,17 +299,16 @@ export default function App() {
           if (runtimeRef.current.cancelled) return;
 
           const metadata = variants[i].metadata || buildVariantMetadata(variants[i].variantNumber);
-          const spoofed = await applyMetadataSpoof(encoded, metadata);
-          const objectUrl = URL.createObjectURL(spoofed);
+          const objectUrl = URL.createObjectURL(encoded);
 
           variants[i] = {
             ...variants[i],
             status: 'completed',
             progress: 100,
             currentStage: 'Completed',
-            outputBlob: spoofed,
+            outputBlob: encoded,
             videoUrl: objectUrl,
-            fileSize: formatBytes(spoofed.size),
+            fileSize: formatBytes(encoded.size),
             metadata,
           };
           publish(
@@ -406,11 +405,11 @@ export default function App() {
   };
 
   const getSpoofedBlob = async (variant: GeneratedVariant) => {
-    if (variant.outputBlob) return variant.outputBlob;
+    const metadata = variant.metadata || buildVariantMetadata(variant.variantNumber);
+    if (variant.outputBlob) return applyMetadataSpoof(variant.outputBlob, metadata);
     const sourceUrl = variant.videoUrl || sourceVideo?.url;
     if (!sourceUrl) throw new Error('No source video');
     const original = await fetch(sourceUrl).then((res) => res.blob());
-    const metadata = variant.metadata || buildVariantMetadata(variant.variantNumber);
     return applyMetadataSpoof(original, metadata);
   };
 
@@ -479,7 +478,7 @@ export default function App() {
       const folder = zip.folder(`Video_Variants_${Date.now()}`);
 
       const manifest = {
-        app: 'Video Variant Generator',
+        app: 'Typhoon Agency Spoofer',
         sourceVideo: sourceVideo?.name,
         generatedAt: new Date().toISOString(),
         totalVariants: ready.length,
