@@ -180,27 +180,11 @@ function patchMp4Times(bytes: Uint8Array, metadata: VariantFileMetadata) {
   walk(moov.offset + moov.header, moov.offset + moov.size);
 }
 
-function insertAfter(bytes: Uint8Array, insertAt: number, extra: Uint8Array): Uint8Array {
+function appendBytes(bytes: Uint8Array, extra: Uint8Array): Uint8Array {
   const next = new Uint8Array(bytes.length + extra.length);
-  next.set(bytes.subarray(0, insertAt), 0);
-  next.set(extra, insertAt);
-  next.set(bytes.subarray(insertAt), insertAt + extra.length);
+  next.set(bytes, 0);
+  next.set(extra, bytes.length);
   return next;
-}
-
-function readVint(bytes: Uint8Array, offset: number): { value: number; length: number } | null {
-  if (offset >= bytes.length) return null;
-  const first = bytes[offset];
-  let length = 1;
-  let mask = 0x80;
-  while (length <= 8 && (first & mask) === 0) {
-    length += 1;
-    mask >>= 1;
-  }
-  if (length > 8 || offset + length > bytes.length) return null;
-  let value = first & (mask - 1);
-  for (let i = 1; i < length; i++) value = (value << 8) | bytes[offset + i];
-  return { value, length };
 }
 
 function buildWebmVoid(metadata: VariantFileMetadata): Uint8Array {
@@ -214,23 +198,16 @@ function buildWebmVoid(metadata: VariantFileMetadata): Uint8Array {
 }
 
 export function spoofContainerBytes(bytes: Uint8Array, metadata: VariantFileMetadata): Uint8Array {
+  // Append unique boxes at the end. Inserting after ftyp/EBML shifts mdat and
+  // invalidates MP4 chunk offsets (stco/co64), so players refuse to play the file.
   if (bytes.length >= 8 && readAscii(bytes, 4, 4) === 'ftyp') {
-    const ftyp = findBox(bytes, 'ftyp');
-    if (!ftyp) return bytes;
-    const withUuid = insertAfter(bytes, ftyp.offset + ftyp.size, buildUuidBox(metadata));
-    patchMp4Times(withUuid, metadata);
-    return withUuid;
+    const next = appendBytes(bytes, buildUuidBox(metadata));
+    patchMp4Times(next, metadata);
+    return next;
   }
 
   if (bytes.length >= 4 && bytes[0] === 0x1a && bytes[1] === 0x45 && bytes[2] === 0xdf && bytes[3] === 0xa3) {
-    const id = readVint(bytes, 0);
-    const size = id ? readVint(bytes, id.length) : null;
-    if (id && size) {
-      const headerEnd = id.length + size.length + size.value;
-      if (headerEnd > 0 && headerEnd < bytes.length) {
-        return insertAfter(bytes, headerEnd, buildWebmVoid(metadata));
-      }
-    }
+    return appendBytes(bytes, buildWebmVoid(metadata));
   }
 
   return bytes;

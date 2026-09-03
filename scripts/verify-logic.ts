@@ -11,6 +11,10 @@ function assert(condition: unknown, message: string) {
   }
 }
 
+function readAsciiForTest(bytes: Uint8Array, offset: number, length: number): string {
+  return String.fromCharCode(...bytes.subarray(offset, offset + length));
+}
+
 const source: SourceVideo = {
   id: 'test',
   name: 'clip.mp4',
@@ -81,16 +85,23 @@ assert(args[0] === '-i' && args[1] === 'in.mp4', 'ffmpeg args should start with 
 assert(args.includes('out.mp4'), 'ffmpeg args should include output');
 assert(args.includes('-map_metadata'), 'ffmpeg args should strip source metadata');
 assert(args.includes('ultrafast'), 'wasm args should use a fast preset');
+assert(args.includes('aac'), 'wasm args should encode audio as aac');
+assert(!args.includes('+faststart+use_metadata_tags'), 'wasm args should not use faststart');
 assert(!args.some((arg) => arg.includes('drawtext')), 'wasm args should skip drawtext');
 
 const ftyp = new Uint8Array([
   0, 0, 0, 20, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d, 0, 0, 0, 0, 0x69, 0x73, 0x6f, 0x6d,
-  0, 0, 0, 8, 0x66, 0x72, 0x65, 0x65,
+  0, 0, 0, 16, 0x6d, 0x64, 0x61, 0x74, 1, 2, 3, 4, 5, 6, 7, 8,
 ]);
 const a = spoofContainerBytes(ftyp, buildVariantMetadata(1));
 const b = spoofContainerBytes(ftyp, buildVariantMetadata(2));
 assert(a.length > ftyp.length, 'mp4 spoof should insert a unique box');
 assert(Buffer.from(a).toString('hex') !== Buffer.from(b).toString('hex'), 'spoofed containers must differ');
+assert(
+  Buffer.from(a.subarray(0, ftyp.length)).equals(Buffer.from(ftyp)),
+  'mp4 spoof must append after mdat so chunk offsets stay valid'
+);
+assert(readAsciiForTest(a, ftyp.length + 4, 4) === 'uuid', 'appended box should be a uuid atom');
 
 let currentIdx = 0;
 let variantProg = 10;

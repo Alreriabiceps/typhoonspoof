@@ -140,7 +140,22 @@ export function generateFFmpegArgs(
   if (!options?.wasmSafe) {
     args.push('-maxrate', bitrate, '-bufsize', '20M');
   }
-  args.push('-preset', preset, '-threads', '1', '-c:a', 'aac', '-b:a', options?.wasmSafe ? '128k' : '192k');
+  args.push(
+    '-preset',
+    preset,
+    '-threads',
+    '1',
+    '-c:a',
+    'aac',
+    '-b:a',
+    options?.wasmSafe ? '128k' : '192k',
+    '-ar',
+    '44100',
+    '-ac',
+    '2'
+  );
+  // faststart rewrites the file in a second pass and often fails in ffmpeg.wasm,
+  // which then fell back to a silent (-an) encode.
   if (options?.wasmSafe) {
     args.push('-movflags', '+use_metadata_tags');
   } else {
@@ -149,6 +164,22 @@ export function generateFFmpegArgs(
   if (metadata) args.push(...metadataFfmpegArgList(metadata));
   args.push(outputFilename);
   return args;
+}
+
+function dropArgPair(args: string[], flag: string): string[] {
+  const next: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === flag) {
+      i += 1;
+      continue;
+    }
+    next.push(args[i]);
+  }
+  return next;
+}
+
+export function generateAudioKeepFallbackArgs(args: string[]): string[] {
+  return dropArgPair(args, '-af');
 }
 
 export function generateMinimalWasmArgs(
@@ -174,9 +205,29 @@ export function generateMinimalWasmArgs(
     '23',
     '-threads',
     '1',
-    '-an',
+    '-c:a',
+    'aac',
+    '-ar',
+    '44100',
+    '-ac',
+    '2',
+    '-b:a',
+    '128k',
+    '-movflags',
+    '+use_metadata_tags',
     outputFilename,
   ];
+}
+
+export function generateVideoOnlyWasmArgs(
+  inputFilename: string,
+  outputFilename: string,
+  format: AspectRatioFormat,
+  quality: QualityTier,
+  source?: { width: number; height: number }
+): string[] {
+  const withAudio = generateMinimalWasmArgs(inputFilename, outputFilename, format, quality, source);
+  return generateFFmpegArgsWithoutAudio(withAudio);
 }
 
 export function generateFFmpegArgsWithoutAudio(args: string[]): string[] {
@@ -184,7 +235,7 @@ export function generateFFmpegArgsWithoutAudio(args: string[]): string[] {
   for (let i = 0; i < args.length; i++) {
     const current = args[i];
     const following = args[i + 1];
-    if (current === '-af' || current === '-c:a' || current === '-b:a') {
+    if (current === '-af' || current === '-c:a' || current === '-b:a' || current === '-ar' || current === '-ac') {
       i += 1;
       continue;
     }

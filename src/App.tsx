@@ -12,8 +12,10 @@ import { applyMetadataSpoof, buildVariantMetadata } from './utils/metadataSpoof'
 import {
   generateFFmpegArgs,
   generateFFmpegArgsWithoutAudio,
+  generateAudioKeepFallbackArgs,
   generateFFmpegCommand,
   generateMinimalWasmArgs,
+  generateVideoOnlyWasmArgs,
 } from './utils/ffmpegGenerator';
 import {
   deleteInputFile,
@@ -257,8 +259,16 @@ export default function App() {
             );
 
           const fallbackArgs = [
-            generateFFmpegArgsWithoutAudio(args),
+            generateAudioKeepFallbackArgs(args),
             generateMinimalWasmArgs(
+              inputName,
+              outName,
+              variants[i].aspectRatio,
+              variants[i].quality,
+              sourceVideo.resolution
+            ),
+            generateFFmpegArgsWithoutAudio(args),
+            generateVideoOnlyWasmArgs(
               inputName,
               outName,
               variants[i].aspectRatio,
@@ -421,7 +431,7 @@ export default function App() {
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    window.setTimeout(() => URL.revokeObjectURL(url), 2000);
+    window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
   };
 
   const handleUpdateVariantMetadata = (variantId: string, metadata: GeneratedVariant['metadata']) => {
