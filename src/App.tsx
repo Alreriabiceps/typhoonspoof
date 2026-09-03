@@ -424,10 +424,12 @@ export default function App() {
   };
 
   const triggerDownload = (blob: Blob, filename: string) => {
-    const url = URL.createObjectURL(blob);
+    const file = new File([blob], filename, { type: 'video/mp4' });
+    const url = URL.createObjectURL(file);
     const a = document.createElement('a');
     a.href = url;
     a.download = filename;
+    a.rel = 'noopener';
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);

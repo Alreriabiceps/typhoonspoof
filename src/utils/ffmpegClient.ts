@@ -2,7 +2,6 @@ import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { fetchFile, toBlobURL } from '@ffmpeg/util';
 
 const CORE_VERSION = '0.12.6';
-const CORE_BASE = `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${CORE_VERSION}/dist/esm`;
 
 let ffmpeg: FFmpeg | null = null;
 let loadPromise: Promise<FFmpeg> | null = null;
@@ -18,10 +17,19 @@ function parseTimecode(message: string): number | null {
   return hours * 3600 + minutes * 60 + seconds;
 }
 
-async function loadCore(instance: FFmpeg) {
+function coreBases(): string[] {
+  const local = `${String(import.meta.env.BASE_URL || '/').replace(/\/$/, '')}/ffmpeg`;
+  return [
+    local,
+    `https://unpkg.com/@ffmpeg/core@${CORE_VERSION}/dist/esm`,
+    `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${CORE_VERSION}/dist/esm`,
+  ];
+}
+
+async function loadFromBase(instance: FFmpeg, base: string) {
   await instance.load({
-    coreURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.js`, 'text/javascript'),
-    wasmURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.wasm`, 'application/wasm'),
+    coreURL: await toBlobURL(`${base}/ffmpeg-core.js`, 'text/javascript'),
+    wasmURL: await toBlobURL(`${base}/ffmpeg-core.wasm`, 'application/wasm'),
   });
 }
 
@@ -30,9 +38,22 @@ export async function getFFmpeg(): Promise<FFmpeg> {
   if (loadPromise) return loadPromise;
 
   loadPromise = (async () => {
-    const instance = new FFmpeg();
-    await loadCore(instance);
-    return instance;
+    let lastError: unknown;
+    for (const base of coreBases()) {
+      const instance = new FFmpeg();
+      try {
+        await loadFromBase(instance, base);
+        return instance;
+      } catch (error) {
+        lastError = error;
+        try {
+          instance.terminate();
+        } catch {
+          // Ignore terminate failures from a half-loaded core.
+        }
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error('Could not load encoder');
   })();
 
   try {
@@ -123,7 +144,8 @@ export async function encodeToBlob(
     const copy = new Uint8Array(source.byteLength);
     copy.set(source);
     onProgress?.(1);
-    return new Blob([copy], { type: 'video/mp4' });
+    const copyBuffer = copy.buffer.slice(copy.byteOffset, copy.byteOffset + copy.byteLength);
+    return new Blob([copyBuffer], { type: 'video/mp4' });
   } finally {
     instance.off('progress', handleProgress);
     instance.off('log', handleLog);

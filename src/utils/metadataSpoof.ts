@@ -28,15 +28,6 @@ function randomUuid(): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-function uuidToBytes(uuid: string): Uint8Array {
-  const hex = uuid.replace(/-/g, '');
-  const bytes = new Uint8Array(16);
-  for (let i = 0; i < 16; i++) {
-    bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16) || 0;
-  }
-  return bytes;
-}
-
 export function buildVariantMetadata(
   variantNumber: number,
   template: MetadataTemplate = DEFAULT_METADATA_TEMPLATE,
@@ -100,44 +91,113 @@ function writeU32(bytes: Uint8Array, offset: number, value: number) {
   bytes[offset + 3] = value & 0xff;
 }
 
+type Mp4Box = { offset: number; size: number; header: number; type: string };
+
+function readBoxAt(bytes: Uint8Array, offset: number, end = bytes.length): Mp4Box | null {
+  if (offset + 8 > end) return null;
+  let size = readU32(bytes, offset);
+  const type = readAscii(bytes, offset + 4, 4);
+  let header = 8;
+  if (size === 1 && offset + 16 <= end) {
+    header = 16;
+    size = Number((BigInt(readU32(bytes, offset + 8)) << 32n) + BigInt(readU32(bytes, offset + 12)));
+  } else if (size === 0) {
+    size = end - offset;
+  }
+  if (size < header || offset + size > end) return null;
+  return { offset, size, header, type };
+}
+
 function findBox(bytes: Uint8Array, type: string, start = 0, end = bytes.length) {
   let offset = start;
   while (offset + 8 <= end) {
-    let size = readU32(bytes, offset);
-    const boxType = readAscii(bytes, offset + 4, 4);
-    let header = 8;
-    if (size === 1 && offset + 16 <= end) {
-      header = 16;
-      size = Number((BigInt(readU32(bytes, offset + 8)) << 32n) + BigInt(readU32(bytes, offset + 12)));
-    } else if (size === 0) {
-      size = end - offset;
-    }
-    if (size < header) break;
-    if (boxType === type) return { offset, size, header };
-    offset += size;
+    const box = readBoxAt(bytes, offset, end);
+    if (!box) break;
+    if (box.type === type) return box;
+    offset += box.size;
   }
   return null;
 }
 
-function buildUuidBox(metadata: VariantFileMetadata): Uint8Array {
-  const payload = new TextEncoder().encode(
-    JSON.stringify({
-      title: metadata.title,
-      comment: metadata.comment,
-      encoder: metadata.encoder,
-      creation_time: metadata.creationTime,
-    })
-  );
-  const size = 8 + 16 + payload.length;
-  const box = new Uint8Array(size);
-  writeU32(box, 0, size);
-  box[4] = 0x75; // u
-  box[5] = 0x75; // u
-  box[6] = 0x69; // i
-  box[7] = 0x64; // d
-  box.set(uuidToBytes(metadata.uuid), 8);
-  box.set(payload, 24);
-  return box;
+function listTopLevelBoxes(bytes: Uint8Array): Mp4Box[] {
+  const boxes: Mp4Box[] = [];
+  let offset = 0;
+  while (offset + 8 <= bytes.length) {
+    const box = readBoxAt(bytes, offset);
+    if (!box) break;
+    boxes.push(box);
+    offset += box.size;
+  }
+  return boxes;
+}
+
+function patchChunkOffsets(bytes: Uint8Array, moovStart: number, moovEnd: number, delta: number) {
+  if (delta === 0) return;
+  const containers = new Set(['moov', 'trak', 'mdia', 'minf', 'stbl', 'edts']);
+  const walk = (start: number, end: number) => {
+    let cursor = start;
+    while (cursor + 8 <= end) {
+      const box = readBoxAt(bytes, cursor, end);
+      if (!box) break;
+      if (box.type === 'stco' && cursor + box.header + 8 <= end) {
+        const count = readU32(bytes, cursor + box.header + 4);
+        let pointer = cursor + box.header + 8;
+        for (let i = 0; i < count && pointer + 4 <= end; i += 1, pointer += 4) {
+          writeU32(bytes, pointer, (readU32(bytes, pointer) + delta) >>> 0);
+        }
+      }
+      if (box.type === 'co64' && cursor + box.header + 8 <= end) {
+        const count = readU32(bytes, cursor + box.header + 4);
+        let pointer = cursor + box.header + 8;
+        for (let i = 0; i < count && pointer + 8 <= end; i += 1, pointer += 8) {
+          const value =
+            (BigInt(readU32(bytes, pointer)) << 32n) + BigInt(readU32(bytes, pointer + 4)) + BigInt(delta);
+          writeU32(bytes, pointer, Number(value >> 32n));
+          writeU32(bytes, pointer + 4, Number(value & 0xffffffffn));
+        }
+      }
+      if (containers.has(box.type)) {
+        walk(cursor + box.header, cursor + box.size);
+      }
+      cursor += box.size;
+    }
+  };
+  walk(moovStart, moovEnd);
+}
+
+export function makeMp4Faststart(bytes: Uint8Array): Uint8Array {
+  if (bytes.length < 16 || readAscii(bytes, 4, 4) !== 'ftyp') return bytes;
+  const boxes = listTopLevelBoxes(bytes);
+  const mdat = boxes.find((box) => box.type === 'mdat');
+  const moov = boxes.find((box) => box.type === 'moov');
+  if (!mdat || !moov || moov.offset < mdat.offset) return bytes;
+
+  const head = boxes.filter((box) => box.type !== 'mdat' && box.type !== 'moov' && box.offset < mdat.offset);
+  const middle = boxes.filter((box) => box.offset > mdat.offset && box.offset < moov.offset);
+  const tail = boxes.filter((box) => box.offset > moov.offset);
+  const newMdatOffset = head.reduce((total, box) => total + box.size, 0) + moov.size;
+  const delta = newMdatOffset - mdat.offset;
+
+  const output = new Uint8Array(bytes.length);
+  let written = 0;
+  const copyBox = (box: Mp4Box) => {
+    output.set(bytes.subarray(box.offset, box.offset + box.size), written);
+    written += box.size;
+  };
+  for (const box of head) copyBox(box);
+  const moovStart = written;
+  copyBox(moov);
+  copyBox(mdat);
+  for (const box of middle) copyBox(box);
+  for (const box of tail) copyBox(box);
+  if (written !== bytes.length) return bytes;
+  patchChunkOffsets(output, moovStart, moovStart + moov.size, delta);
+  return output;
+}
+
+export function bytesToVideoBlob(bytes: Uint8Array): Blob {
+  const copy = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  return new Blob([copy], { type: 'video/mp4' });
 }
 
 function isoToMp4Time(iso: string): number {
@@ -198,12 +258,10 @@ function buildWebmVoid(metadata: VariantFileMetadata): Uint8Array {
 }
 
 export function spoofContainerBytes(bytes: Uint8Array, metadata: VariantFileMetadata): Uint8Array {
-  // Append unique boxes at the end. Inserting after ftyp/EBML shifts mdat and
-  // invalidates MP4 chunk offsets (stco/co64), so players refuse to play the file.
   if (bytes.length >= 8 && readAscii(bytes, 4, 4) === 'ftyp') {
-    const next = appendBytes(bytes, buildUuidBox(metadata));
-    patchMp4Times(next, metadata);
-    return next;
+    const playable = makeMp4Faststart(bytes);
+    patchMp4Times(playable, metadata);
+    return playable;
   }
 
   if (bytes.length >= 4 && bytes[0] === 0x1a && bytes[1] === 0x45 && bytes[2] === 0xdf && bytes[3] === 0xa3) {
@@ -215,7 +273,5 @@ export function spoofContainerBytes(bytes: Uint8Array, metadata: VariantFileMeta
 
 export async function applyMetadataSpoof(file: Blob, metadata: VariantFileMetadata): Promise<Blob> {
   const buffer = new Uint8Array(await file.arrayBuffer());
-  const spoofed = spoofContainerBytes(buffer, metadata);
-  if (spoofed === buffer) return file;
-  return new Blob([spoofed], { type: file.type || 'video/mp4' });
+  return bytesToVideoBlob(spoofContainerBytes(buffer, metadata));
 }
